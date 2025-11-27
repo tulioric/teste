@@ -2,3 +2,5 @@ kubectl get pods -n <namespace> \
   --selector=$(kubectl get deployment <deployment> -n <namespace> -o jsonpath='{.spec.selector.matchLabels}') \
   --field-selector=status.phase=Running \
   -o jsonpath='{.items[0].metadata.name}'
+
+yq -o=json . arquivo.yaml | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")'
