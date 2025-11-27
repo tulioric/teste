@@ -4,3 +4,65 @@ kubectl get pods -n <namespace> \
   -o jsonpath='{.items[0].metadata.name}'
 
 yq -o=json . arquivo.yaml | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")'
+
+
+Para pegar (listar) os **pods pertencentes a um Deployment no Kubernetes**, você pode usar um dos comandos abaixo.
+
+### ✔️ Forma mais comum — usando o *label selector* do Deployment
+
+Primeiro, obtenha os labels do Deployment:
+
+```bash
+kubectl get deployment <nome-do-deployment> -n <namespace> --show-labels
+```
+
+Depois liste os pods usando o label:
+
+```bash
+kubectl get pods -n <namespace> -l <label>=<valor>
+```
+
+### 🔥 Forma direta (mais usada)
+
+```bash
+kubectl get pods -n <namespace> -l app=<nome-do-deployment>
+```
+
+> Isso funciona se o Deployment adicionar a label `app=<nome>` nos pods (é o mais comum).
+
+---
+
+### 📌 Forma automática via *owner reference* (sem saber labels)
+
+```bash
+kubectl get pods -n <namespace> --field-selector=metadata.ownerReferences[0].kind=ReplicaSet \
+| grep $(kubectl get rs -n <namespace> -l app=<nome-do-deployment> -o jsonpath='{.items[0].metadata.name}')
+```
+
+---
+
+### 💡 Forma resumida (mais prática)
+
+```bash
+kubectl get pods -n <namespace> --selector=$(kubectl get deployment <nome-do-deployment> -n <namespace> -o jsonpath='{.spec.selector.matchLabels}')
+```
+
+---
+
+### 🧪 Exemplo completo
+
+```bash
+kubectl get pods -n production -l app=my-api
+```
+
+---
+
+### ✨ Dica para acompanhar os pods em tempo real
+
+```bash
+kubectl get pods -n <namespace> -l app=<nome-do-deployment> -w
+```
+
+---
+
+Se quiser, posso montar um **script bash** que recebe o deployment e o namespace e já retorna apenas os pods, ou até logs de todos eles. É só pedir 👌
