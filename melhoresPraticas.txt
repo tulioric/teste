@@ -1,0 +1,184 @@
+Abaixo está um guia completo com **melhores práticas, otimizações de configuração e recomendações de arquitetura para RabbitMQ em Kubernetes**, considerando cenários de alta disponibilidade, observabilidade, segurança e desempenho.
+
+---
+
+## 🚀 **1. Formas recomendadas de rodar RabbitMQ em Kubernetes**
+
+| Método                                   | Quando usar                          | Observações                          |
+| ---------------------------------------- | ------------------------------------ | ------------------------------------ |
+| **Helm Chart Oficial (Bitnami)**         | Cenários comuns e CI/CD simplificado | Mais fácil, ótimo para produção      |
+| **Operator (RabbitMQ Cluster Operator)** | Alta disponibilidade + automação     | Melhor escolha para clusters grandes |
+| **Container “na mão” (StatefulSet)**     | Ambientes simples e controle máximo  | Requer mais experiência e scripts    |
+
+> Para ambientes corporativos e escaláveis → **RabbitMQ Cluster Operator é o mais recomendado.**
+
+---
+
+## 🧱 **2. Configuração recomendada para StatefulSet**
+
+### ✔️ Storage
+
+* Use **Persistent Volume Claims (PVCs)**
+* Armazenamento rápido (NVMe / SSD)
+* **ReadWriteOnce (RWO)** — obrigatório para manter integridade do cluster
+
+### ✔️ Topologia
+
+```
+replicas: 3   # mínimo para HA
+podManagementPolicy: Parallel
+updateStrategy: RollingUpdate
+```
+
+### ✔️ Networking
+
+* Service do tipo **Headless** para descoberta dos nodes
+* Defina `hostname` estável por pod via `statefulset.kubernetes.io/pod-name`
+
+---
+
+## ⚙️ **3. Configurações internas do RabbitMQ (production grade)**
+
+### 🔧 Sistema
+
+| Configuração                    | Valor recomendado              |
+| ------------------------------- | ------------------------------ |
+| `vm_memory_high_watermark`      | 0.75                           |
+| `disk_free_limit`               | 2GB (mínimo)                   |
+| `cluster_partition_handling`    | `pause_minority`               |
+| `default_user` / `default_pass` | *Desabilitar usuário guest*    |
+| `default_vhost`                 | Criar vhost separado para apps |
+
+### 🧵 Filas & Mensageria
+
+| Tipo de fila           | Quando usar                                |
+| ---------------------- | ------------------------------------------ |
+| **Quorum Queue**       | Transações críticas / alta disponibilidade |
+| Classic Mirrored Queue | Compatibilidade com sistemas legados       |
+| Lazy Queue             | Processamento assíncrono pesado            |
+
+#### Recomendações:
+
+* Não crie centenas de milhares de filas → degrada rapidamente
+* Prefira **Quorum Queues** → tolerância a falhas melhor
+
+---
+
+## 📈 **4. Recursos do Kubernetes**
+
+### Requests e Limits
+
+| Tipo         | Recomendação |
+| ------------ | ------------ |
+| CPU Requests | ≥ 1 vCPU     |
+| CPU Limit    | 2–4 vCPU     |
+| RAM Requests | ≥ 2 GB       |
+| RAM Limit    | 4–16 GB      |
+
+### Node Affinity / Anti-Affinity
+
+```yaml
+podAntiAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+  - topologyKey: "kubernetes.io/hostname"
+```
+
+> Garante que réplicas não fiquem no mesmo nó → evita perda total.
+
+---
+
+## 📡 **5. Observabilidade**
+
+### Exporters Recomendados
+
+| Finalidade        | Recurso                                            |
+| ----------------- | -------------------------------------------------- |
+| Métricas          | **Prometheus + rabbitmq_exporter**                 |
+| Dashboards        | **Grafana** (Dashboards padrões disponíveis)       |
+| Logs estruturados | Log em JSON para Fluentd / Loki                    |
+| tracing           | Opencensus / OTEL (se precisar rastrear mensagens) |
+
+**Alarmes obrigatórios**
+
+* Conexões abertas > limite
+* Fila de mensagens em crescimento constante
+* No leader eleito (em Quorum Queues)
+* Uso de disco / memória perto do limite
+
+---
+
+## 🔐 **6. Segurança**
+
+### Recomendações
+
+* **Desabilitar guest**
+* Use **TLS** para AMQP e Management
+* NetworkPolicies → liberar apenas apps necessárias
+* Secrets → usuário, senha e certificados via `Secret`
+* Ativar **LDAP / IAM / OIDC** se estiver no ambiente corporativo
+
+---
+
+## 🧵 **7. Autosscaling (HPA)**
+
+RabbitMQ **não escala horizontalmente como Redis**.
+O recomendado é:
+
+### Escalar **producers** e **consumers**
+
+RabbitMQ:
+
+* Manter fixo (3 nodes ou 5 em clusters muito grandes)
+* Nunca escalar StatefulSet automaticamente
+
+---
+
+## 💣 **8. Anti-padrões comuns**
+
+| Evitar                                        | Problema causado                     |
+| --------------------------------------------- | ------------------------------------ |
+| Pods sem PVC                                  | perdas totais de mensagens e cluster |
+| Um único replica                              | downtime em falha do nó              |
+| Configurar HA com Mirrored Queue antiga       | pode gerar storm no cluster          |
+| Criar filas sob demanda                       | degrada o cluster rapidamente        |
+| Criar um cluster muito grande (ex. 10+ nodes) | latência e sincronização alta        |
+
+---
+
+## 🎯 Exemplo de configuração robusta (resumo YAML – Operator)
+
+```yaml
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: rmq-prod
+spec:
+  replicas: 3
+  persistence:
+    storageClassName: fast-ssd
+    storage: 20Gi
+  resources:
+    requests:
+      memory: 4Gi
+      cpu: 1
+    limits:
+      memory: 8Gi
+      cpu: 4
+  rabbitmq:
+    additionalConfig: |
+      vm_memory_high_watermark.relative = 0.75
+      disk_free_limit.absolute = 2GB
+      cluster_partition_handling = pause_minority
+```
+
+---
+
+## 🚀 Se quiser, posso gerar:
+
+🔹 Um **Helm chart completo**
+🔹 Um **YAML 100% pronto para produção** (Operator ou StatefulSet)
+🔹 **Pipeline CI/CD para instalar RabbitMQ**
+🔹 **Grafana dashboards + Prometheus alerts recomendados**
+
+👉 Me diga qual abordagem você usa (Helm, Operator ou StatefulSet) e posso montar o pacote completo.
+Se quiser já configurar com RabbitMQ + Dynatrace + Fluentd, também faço. 💪
