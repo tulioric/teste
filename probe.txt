@@ -1,0 +1,162 @@
+Boa — é um tema importante. Achei informações documentadas e relatos da comunidade sobre falhas / problemas de memória com RabbitMQ executando em contêiner / Kubernetes. Com base aí, e considerando o que dá para controlar via “probes” + configuração + boas práticas, abaixo vai um diagnóstico + recomendações de probes / alertas / configuração para **evitar ou mitigar falhas de memória**.
+
+---
+
+## 🔎 Problemas/Contextos de falhas de memória no RabbitMQ
+
+* O RabbitMQ usa um mecanismo interno de limite de memória (`vm_memory_high_watermark`) para bloquear publishers quando o uso de memória ultrapassa um limiar. ([rabbitmq.com][1])
+* Em ambientes containerizados / Kubernetes, esse limiar é particularmente relevante — e recomenda-se usar **limite absoluto** em vez de relativo, pois a detecção automática de memória disponível pode estar errada. ([rabbitmq.com][1])
+* Há relatos de instâncias onde, mesmo com watermark configurado, o uso de memória disparou — por exemplo: “uso de 0.5 GB → 9 GB em 10 minutos” sem aumento perceptível nas métricas de mensagens, canais, conexões etc. ([Google Groups][2])
+* Em Kubernetes, com `limits/requests` insuficientes, o contêiner pode ser OOMKilled mesmo antes de o RabbitMQ “perceber” que está usando muita memória. ([GitHub][3])
+* Um caso recente (2025) relata que após upgrade para versão 3.13.6, o broker “crasha” sob certas cargas — por exemplo, ao buscar 10 000 mensagens via HTTP API com ack automático, especialmente quando filas grandes (~100 MB) — mesmo sem pico visível de RAM externamente. ([GitHub][4])
+
+Conclusão: mesmo com configurações “padrão”, há cenários reais de sobrecarga de memória / falha de memória / OOM + alarmes de memória no RabbitMQ em Kubernetes. Por isso é prudente adotar probes e alertas pró-ativos — não apenas confiar no watermark interno.
+
+---
+
+## ✅ Estratégias e configurações recomendadas para mitigar riscos de memória
+
+Antes das probes, vale ajustar o RabbitMQ para reduzir chances de uso excessivo:
+
+* **Usar `vm_memory_high_watermark.absolute`** — definir explicitamente um valor fixo compatível com os recursos alocados ao pod. Ex: `vm_memory_high_watermark.absolute = 4Gi`. ([rabbitmq.com][1])
+* **Garantir requests/limits adequados no pod (RAM & CPU)**; evitar usar valores baixos sob risco de OOM. ([GitHub][3])
+* **Limitar backlog de mensagens, filas e conexões** — muitos dados apontam que acúmulo de mensagens não consumidas, muitas filas, muitas conexões/canais lentos ou clientes abrindo/fechando conexões frequentemente são causas comuns de alta memória / CPU. ([CloudAMQP][5])
+* **Preferir filas que minimizam uso de RAM**, se possível — ex: usar filas “lazy” ou versões de fila que persistem no disco, quando o uso de memória deve ser reduzido. ([CloudAMQP][5])
+
+Mas isso não elimina totalmente o risco — por isso, vamos à parte prática: *probes e alertas*.
+
+---
+
+## 🛠 Probes / Liveness- & Readiness-Probes + alertas para Kubernetes + Observabilidade
+
+Aqui vão sugestões de como configurar probes + monitoramento para identificar antes que o nó sofra falhas graves de memória / OOM / bloqueio.
+
+### 🔹 Liveness / Readiness Probes (Kubernetes)
+
+Você pode criar probes customizados (HTTP / exec / script) que verificam:
+
+* **Uso de memória do processo RabbitMQ** (RSS, ou memória relatada pela API do RabbitMQ). Se ultrapassar um limiar “seguro” (ex: 75–85% do memory limit do pod), marcar como falha → pod será reiniciado.
+* **Status de “memory alarm” do RabbitMQ** — através da API HTTP de gerenciamento ou CLI (`rabbitmq-diagnostics status` + filtro), verificando se há alarmes de memória/disco. Se alarmes ativos há mais que X tempo, marcar como “unready” ou “liveness fail”.
+* **Número de mensagens nas filas + backlog não consumido** — se existirem filas muito grandes ou backlog crescente por muito tempo, sinalizar problema.
+
+Exemplo de probe (pseudocódigo shell + Kubernetes YAML):
+
+```yaml
+livenessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # usa rabbitmq-diagnostics ou API HTTP para checar
+        mem=$(rabbitmq-diagnostics status -q | grep memory | awk '{print $2}')
+        limit=4Gi  # ou parse de env
+        perc=$(expr $mem \* 100 / $limit)
+        [ $perc -lt 85 ]
+  initialDelaySeconds: 60
+  periodSeconds: 30
+```
+
+Ou via HTTP:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /api/healthchecks/node
+    port: 15672
+    scheme: HTTP
+  initialDelaySeconds: 30
+  periodSeconds: 20
+```
+
+(com endpoint de healthcheck customizado que inclua verificação de memory alarm e uso de memória)
+
+### 🔹 Monitoramento + Alertas com Prometheus / Grafana (observabilidade)
+
+* Expor métricas de memória via `rabbitmq_exporter` ou via API de status. Monitorar: memória alocada, memória usada, “allocated_unused”, pools Erlang, uso de page cache, número de filas, número de consumidores, backlog por fila. ([rabbitmq.com][6])
+* Criar alertas como:
+
+  * Se memória usada > 70–80% do limite por mais de N minutos.
+  * Se “memory alarm” ativado /  node em “alarm state”.
+  * Se número de mensagens não consumidas em filas > threshold (ex: backlog > X mensagens ou > Y MB por fila).
+  * Se número de filas ou conexões / canais cresce abruptamente.
+  * Backlog crescendo por mais de N minutos (sinal de consumidor lento ou vazamento).
+
+Esses alertas permitem ação preventiva: escala de consumidores, purga de filas antigas, reinício controlado, investigação de leaks.
+
+### 🔹 Estratégia de reinício controlado / “circuit breaker”
+
+Se os alertas acima dispararem (ex: memória alta contínua, alarmes, backlog persistente), seu sistema pode:
+
+* Migrar consumidores para outro broker / node (se cluster).
+* Reiniciar o pod com tempo de “drain” — desativar publishers, esperar consumir mensagens, depois reiniciar com segurança.
+* Notificar time SRE / Dev para investigação (logs, possíveis leaks, problemas de throughput).
+
+---
+
+## 🔄 Exemplo de YAML com probes + ajustes de configuração (para Kubernetes)
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.13.6
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "1"
+          limits:
+            memory: "6Gi"
+            cpu: "2"
+        env:
+        - name: RABBITMQ_VM_MEMORY_HIGH_WATERMARK_ABSOLUTE
+          value: "4Gi"
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - |
+              mem=$(rabbitmq-diagnostics status -q | grep memory | awk '{print $2}' | sed 's/[^0-9]//g')
+              limit=4096
+              if [ $mem -lt $(($limit * 85 / 100)) ]; then exit 0; else exit 1; fi
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/healthchecks/node
+            port: 15672
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 20
+```
+
+> Obs: o endpoint `/api/healthchecks/node` pode ser substituído por script custom que verifica alarmes de memória/disco + backlog.
+
+---
+
+## ⚠️ Limitações e cuidados
+
+* O watermark interno **não previne totalmente** uso excessivo de memória — apenas bloqueia publishers; se as filas acumularem mensagens (muitas ou grandes), a memória ainda pode crescer até OOM. ([rabbitmq.com][1])
+* Em cgroup / Kubernetes, o RabbitMQ pode “ver” menos memória que o disponível, especialmente se não estiver informando limites corretamente — daí a recomendação de usar `absolute`. ([Google Groups][7])
+* Probes “exec” que chamam `rabbitmq-diagnostics` ou acessam a API consomem recursos; calibração de frequência/política é importante para não sobrecarregar o broker.
+* Reiniciar bruscamente pode causar perda de mensagens em memória ou delays — preferir shutdown “gracioso”, drain de filas, se possível.
+
+---
+
+Se quiser — posso montar **um conjunto completo de alertas Prometheus + regras de Grafana + YAML de probes readiness/liveness + config recomendada** para usar com RabbitMQ em Kubernetes, já adaptado a produção — isso ajuda bastante a evitar incidentes. Quer que monte pra você agora?
+
+[1]: https://www.rabbitmq.com/docs/memory?utm_source=chatgpt.com "Memory Threshold and Limit"
+[2]: https://groups.google.com/g/rabbitmq-users/c/GmX2Ax5sZKg?utm_source=chatgpt.com "RabbitMQ server is out of memory without clear cause"
+[3]: https://github.com/rabbitmq/cluster-operator/discussions/1099?utm_source=chatgpt.com "Question about RabbitMQ Memory Usage especially ..."
+[4]: https://github.com/rabbitmq/rabbitmq-server/discussions/13060?utm_source=chatgpt.com "3.13.6 Node memory spike when polling for 10K messages ..."
+[5]: https://www.cloudamqp.com/blog/identify-and-protect-against-high-cpu-and-memory-usage.html?utm_source=chatgpt.com "How to handle and avoid high CPU or Memory usage"
+[6]: https://www.rabbitmq.com/docs/memory-use?utm_source=chatgpt.com "Reasoning About Memory Use"
+[7]: https://groups.google.com/g/rabbitmq-users/c/ESnCf64vfZ0?utm_source=chatgpt.com "Running RabbitMQ inside container - cgroup (docker) ..."
