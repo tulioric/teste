@@ -1,0 +1,110 @@
+Abaixo segue um exemplo de **probe (liveness e readiness) em Kubernetes usando `rabbitmqctl` para validar uso de memória** e evitar que o pod morra por OOM antes do RabbitMQ entrar em colapso.
+
+---
+
+## ✔️ Ideia da probe
+
+O probe irá:
+
+1. Ler a memória usada pelo broker via `rabbitmqctl status`.
+2. Comparar com um limite seguro (por exemplo, 80% da memória do pod).
+3. Retornar **0 (sucesso)** se estiver abaixo do limite → o pod segue vivo.
+4. Retornar **1 (erro)** se ultrapassar o limite → força Kubernetes a reiniciar o pod antes de OOM.
+
+---
+
+## 🧪 Script usado pelo probe
+
+Esse script pode ser embutido no livenessProbe ou disponibilizado em um ConfigMap:
+
+```sh
+#!/bin/sh
+
+# Memória permitida em MB (ajustar ao limite do pod)
+MEMORY_LIMIT_MB=6000    # ~6Gi (exemplo)
+THRESHOLD_PERCENT=85    # % da utilização permitida
+
+USED_MB=$(rabbitmqctl status -q | grep -E "total_memory" | awk '{print $2}' | tr -d ',')
+# Conversão de bytes para MB
+USED_MB=$(expr $USED_MB / 1024 / 1024)
+
+# Cálculo do limiar
+LIMIT_MB=$(expr $MEMORY_LIMIT_MB \* $THRESHOLD_PERCENT / 100)
+
+if [ "$USED_MB" -gt "$LIMIT_MB" ]; then
+  echo "❌ Memória alta: ${USED_MB}MB (limite: ${LIMIT_MB}MB)"
+  exit 1
+else
+  echo "✓ Memória dentro do limite: ${USED_MB}MB"
+  exit 0
+fi
+```
+
+---
+
+## 🧱 Exemplo completo do probe no Deployment/StatefulSet
+
+```yaml
+livenessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        MEMORY_LIMIT_MB=6000
+        THRESHOLD_PERCENT=85
+        USED_MB=$(rabbitmqctl status -q | grep -E "total_memory" | awk '{print $2}' | tr -d ',' | xargs expr / 1024 / 1024)
+        LIMIT_MB=$(expr $MEMORY_LIMIT_MB \* $THRESHOLD_PERCENT / 100)
+        if [ "$USED_MB" -gt "$LIMIT_MB" ]; then exit 1; else exit 0; fi
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 5
+```
+
+### ReadinessProbe similar (para tirar o pod do tráfego antes de consumir 100% da RAM)
+
+```yaml
+readinessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        MEMORY_LIMIT_MB=6000
+        THRESHOLD_PERCENT=80
+        USED_MB=$(rabbitmqctl status -q | grep -E "total_memory" | awk '{print $2}' | tr -d ',' | xargs expr / 1024 / 1024)
+        LIMIT_MB=$(expr $MEMORY_LIMIT_MB \* $THRESHOLD_PERCENT / 100)
+        if [ "$USED_MB" -gt "$LIMIT_MB" ]; then exit 1; else exit 0; fi
+  initialDelaySeconds: 15
+  periodSeconds: 20
+```
+
+---
+
+## 🔑 Observações importantes
+
+| Ponto                                            | Detalhe                                                        |
+| ------------------------------------------------ | -------------------------------------------------------------- |
+| O comando `rabbitmqctl` roda dentro do contêiner | Portanto o probe deve ser `exec`, não HTTP                     |
+| Esse probe atua preventivamente                  | Ele evita OOM, reiniciando o pod quando ultrapassa um limiar   |
+| Recomendado junto com alerts de backlog          | Alto uso de memória normalmente acompanha acúmulo de mensagens |
+| Ajuste do limite                                 | Sempre vincular ao limit de memória do pod no recurso K8s      |
+
+---
+
+## 🔥 Recomendações avançadas
+
+Para evitar restart durante pico normal de carga:
+
+* Use **somente no liveness** (*readiness pode ser mais sensível*).
+* Use `THRESHOLD_PERCENT` mais alto (90–92%) se o cluster trabalhar com muita fila em memória.
+* Se o RabbitMQ operar com **Quorum Queues**, considere limiar mais baixo (75–80%), pois usam muita RAM para replicação.
+
+---
+
+Se quiser, posso gerar:
+🔹 versão com **ConfigMap + script separado**
+🔹 versão adaptada para **RabbitMQ Cluster Operator**
+🔹 versão com **validação adicional de memory alarm (`rabbitmqctl eval`)**
+
+Quer alguma dessas? 💪
