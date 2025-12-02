@@ -1,80 +1,73 @@
-Entendido — você quer **um script que rode dentro do próprio pod do RabbitMQ (ou dentro de um pod auxiliar)** sem depender de `docker run` externo, para gerar stress e causar OOMKill.
+Entendido:
+✔ o **pod não tem saída externa**
+✔ **não pode instalar curl, wget, apk, yum etc.**
+✔ ainda assim você precisa **gerar stress de memória a partir DE DENTRO do pod**.
 
-A melhor forma é usar o **RabbitMQ PerfTest em Java**, pois ele envia mensagens grandes rapidamente sem precisar de instalar clientes extras.
-
-Abaixo está um script **100% local**, que pode ser executado diretamente **dentro do pod** (ou dentro de um pod sidecar/container de teste).
-
----
-
-## ✅ 1) Baixar o PerfTest (só uma vez dentro do pod)
-
-```bash
-curl -O https://repo1.maven.org/maven2/com/rabbitmq/perf-test/2.20.0/perf-test-2.20.0.jar
-```
-
-> Caso `curl` não esteja disponível, usar `wget`:
-
-```bash
-wget https://repo1.maven.org/maven2/com/rabbitmq/perf-test/2.20.0/perf-test-2.20.0.jar
-```
+A melhor alternativa nessas condições é **usar o `rabbitmqadmin` (que já vem no RabbitMQ Management Plugin)** para publicar mensagens enormes em loop infinito. Isso **aumenta rapidamente o uso de memória das filas**, levando ao **OOMKill do RabbitMQ**.
 
 ---
 
-## 🧨 2) Script local de stress `stress_oom_local.sh`
+## ✅ SCRIPT DE STRESS 100% LOCAL, SEM DOWNLOAD E SEM DEPENDÊNCIAS EXTERNAS
 
-Crie o arquivo dentro do pod:
+> Executar **de dentro do pod que tenha o `rabbitmqadmin`** (pode ser o próprio pod do RabbitMQ ou um pod sidecar contendo a CLI).
+
+Crie o arquivo:
 
 ```bash
 cat << 'EOF' > /tmp/stress_oom_local.sh
 #!/bin/bash
 
-URL="amqp://stress:pass123@localhost:5672/"
+QUEUE="stress-queue"
+ROUTING_KEY="stress"
 EXCHANGE="stress-exchange"
-ROUTING="stress"
-MESSAGE_SIZE=1000000   # 1 MB por mensagem
-PRODUCERS=10
-RATE=1000              # 1000 msgs/segundo por produtor
-DURATION=0             # 0 = infinito (até OOMKill)
 
-echo "📌 Iniciando stress de memória contra o RabbitMQ..."
-echo "   Body size: $MESSAGE_SIZE bytes"
-echo "   Producers: $PRODUCERS"
-echo "   Rate: $RATE msgs/s"
-echo "   Duration: infinito"
+# tamanho da mensagem — ajuste para acelerar o OOMKill
+MSG_SIZE=1000000   # 1 MB
 
-java -jar /tmp/perf-test.jar \
-  --uri $URL \
-  --exchange $EXCHANGE \
-  --routing-key $ROUTING \
-  --producers $PRODUCERS \
-  --consumers 0 \
-  --body-size $MESSAGE_SIZE \
-  --rate $RATE \
-  --id "stress-oom" \
-  --auto-delete false \
-  --duration $DURATION
+# quantas mensagens por ciclo
+BATCH=200
+
+# corpo da mensagem grande
+PAYLOAD=$(printf 'A%.0s' $(seq 1 $MSG_SIZE))
+
+echo "🚀 Iniciando stress de memória no RabbitMQ..."
+echo "   Tamanho da mensagem: $MSG_SIZE bytes"
+echo "   Batch: $BATCH por ciclo"
+echo ""
+
+while true; do
+  for i in $(seq 1 $BATCH); do
+    rabbitmqadmin publish \
+      exchange=$EXCHANGE \
+      routing_key=$ROUTING_KEY \
+      payload="$PAYLOAD" \
+      properties='{"delivery_mode":2}'
+  done
+  echo "[+] $BATCH mensagens enviadas"
+done
 EOF
+
 chmod +x /tmp/stress_oom_local.sh
 ```
 
 ---
 
-## 🚀 3) Executar o script dentro do pod
-
-Assumindo que o `perf-test.jar` foi colocado em `/tmp/perf-test.jar`:
+## ▶ Executar
 
 ```bash
-mv perf-test-2.20.0.jar /tmp/perf-test.jar
 /tmp/stress_oom_local.sh
 ```
 
-O teste começará e continuará até o RabbitMQ entrar em **OOMKill**.
+O script vai rodar continuamente até:
+
+🔹 o watermark explodir → produtores passam a bloquear
+🔹 o container exceder a memória do Kubernetes → **OOMKill**
 
 ---
 
-# 🧪 Recursos esperados para stress
+## ⚠ Antes de rodar, garanta a existência dos recursos
 
-Certifique-se de que o RabbitMQ já tem antes do teste:
+Execute dentro do pod (se ainda não estiver preparado):
 
 ```bash
 rabbitmqctl add_user stress pass123
@@ -85,34 +78,46 @@ rabbitmqadmin declare queue name=stress-queue durable=true
 rabbitmqadmin declare binding source=stress-exchange destination=stress-queue routing_key=stress
 ```
 
+E **use o usuário stress no script** se for necessário autenticação:
+
+```bash
+export RABBITMQ_USER=stress
+export RABBITMQ_PASSWORD=pass123
+```
+
 ---
 
-## 🔥 Dicas para acelerar o OOMKill
+## ⏩ Para acelerar ainda mais o OOMKill
 
-Se quiser forçar o RabbitMQ usar quase toda memória disponível (opcional):
+Rodar antes do stress:
 
 ```bash
 rabbitmqctl set_vm_memory_high_watermark 0.95
 ```
 
----
+E se quiser **garantir que as mensagens fiquem na memória e não no disco**, configure:
 
-## 📌 Resultado típico do teste
-
-O teste causa:
-
-| Efeito                         | Tempo esperado  |
-| ------------------------------ | --------------- |
-| Crescimento da fila em memória | Alguns segundos |
-| Watermark atingido             | ~30–90 segundos |
-| Travamento dos produtores      | Antes do crash  |
-| **OOMKill (queda do pod)**     | ~1–5 minutos    |
+```bash
+rabbitmqctl eval 'rabbit_amqqueue:declare_lazy(<<"stress-queue">>, false).'
+```
 
 ---
 
-Se quiser, posso gerar também:
-💠 manifesto Kubernetes com pod de stress já contendo este script
-💠 readiness probe usando `rabbitmq-diagnostics -q memory_breakdown`
-💠 script reverso para limpar recursos após o stress
+## 🧨 Resultado esperado
 
-É só pedir. 🚀
+| Comportamento                 | Minutos aproximados |
+| ----------------------------- | ------------------- |
+| Crescimento da fila e memória | 0–1 min             |
+| RabbitMQ atinge watermark     | 1–2 min             |
+| Pod trava ou limita           | 2–4 min             |
+| **OOMKill** (queda do pod)    | 3–8 min             |
+
+---
+
+Se quiser, eu também consigo gerar alternativas conforme a sua necessidade:
+
+🔹 script com paralelismo (vários loops simultâneos)
+🔹 script para stress de CPU ao invés de memória
+🔹 script reverso para limpar filas após o teste
+
+Só me dizer qual você precisa. 🚀
