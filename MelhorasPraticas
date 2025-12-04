@@ -1,0 +1,260 @@
+Abaixo está um **documento estruturado** com **melhores práticas para configuração de RabbitMQ em ambiente produtivo de alto volume**, incluindo **boas práticas de StatefulSets/YAML para implantação via Helm Chart**.
+Se quiser, posso também gerar isso em **PDF**, **DOCX**, **Markdown** ou outro formato — é só pedir.
+
+---
+
+# **Guia de Melhores Práticas para RabbitMQ em Ambiente Produtivo de Alto Fluxo**
+
+## **1. Arquitetura e Considerações Gerais**
+
+### **1.1. Dimensionamento do Cluster**
+
+* Utilize **mínimo 3 nós** para alta disponibilidade (quorum queues).
+* Use **quorum queues** para filas críticas, evitando classic mirrored queues (deprecadas).
+* Separe:
+
+  * **Nós de processamento** (clientes publicando/consumindo)
+  * **Nós de persistência** (disco/NVMe rápidos)
+* Prefira **SSD NVMe** com baixa latência para melhor throughput.
+
+### **1.2. Comunicação e Rede**
+
+* Habilite **High Availability Networking**:
+
+  * Aumente `net_ticktime` para evitar split-brain em redes instáveis (ex.: `net_ticktime = 60`).
+* Utilize **cluster formation automática** via peer discovery (consul, k8s, etc.).
+* Habilite **TLS 1.2+** para criptografia de tráfego interno e externo.
+
+---
+
+# **2. Configurações Críticas do RabbitMQ**
+
+## **2.1. Configurações do `rabbitmq.conf`**
+
+### **Persistência e Desempenho**
+
+```ini
+# Aumentar performance de gravação
+vm_memory_high_watermark = 0.7
+vm_memory_high_watermark_mode = relative
+
+# Ajuste de disco para ambientes de alto throughput
+disk_free_limit.relative = 1.0
+```
+
+### **Cluster e Descoberta**
+
+```ini
+cluster_formation.peer_discovery_backend = k8s
+cluster_formation.k8s.address_type = hostname
+cluster_formation.node_cleanup.only_log_warning = true
+```
+
+### **Filas Quorum**
+
+```ini
+quorum_wal_sync_strategy = batch
+quorum_wal_max_size_bytes = 134217728  # 128MB
+```
+
+### **Conexões**
+
+```ini
+max_connections = 50000
+```
+
+---
+
+# **3. Melhores Práticas Operacionais**
+
+### **3.1. Observabilidade**
+
+* Habilite plugins:
+
+  * `rabbitmq_prometheus`
+  * `rabbitmq_management`
+* Use dashboards oficiais do RabbitMQ para Grafana.
+* Monitore especialmente:
+
+  * `Confirmed Publishes`
+  * `Ack Rate`
+  * `Unacked Messages`
+  * `Queue Length`
+  * `File Descriptors`
+
+### **3.2. Manutenção**
+
+* Realize rolling updates (via StatefulSet).
+* Use readiness/liveness probes corretas:
+
+  * `/api/health/checks/node`
+  * `/api/health/checks/alarms`
+
+---
+
+# **4. Melhores Práticas para Deploy no Kubernetes (StatefulSet)**
+
+## **4.1. Topologia**
+
+* Sempre utilize **StatefulSet** com:
+
+  * `volumeClaimTemplates`
+  * `podManagementPolicy: Parallel`
+* Utilize headless service para formação automática do cluster.
+
+## **4.2. Storage**
+
+* Discos rápidos (NVMe).
+* Volume dedicado por nó:
+
+```yaml
+volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: fast-nvme
+      resources:
+        requests:
+          storage: 200Gi
+```
+
+---
+
+# **5. Melhores Práticas no Helm Chart do RabbitMQ**
+
+Quando provisionado via **Bitnami RabbitMQ Helm Chart**, recomenda-se:
+
+## **5.1. Valores essenciais (`values.yaml`)**
+
+### **Cluster Formation**
+
+```yaml
+auth:
+  username: admin
+  password: secure-password
+  erlangCookie: super-secret-cookie
+
+clustering:
+  enabled: true
+  forceBoot: true
+```
+
+### **Recursos**
+
+```yaml
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+  requests:
+    cpu: 1
+    memory: 2Gi
+```
+
+### **Probes**
+
+```yaml
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 60
+  timeoutSeconds: 10
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 20
+  timeoutSeconds: 10
+```
+
+### **Configurações do `rabbitmq.conf` embutidas**
+
+```yaml
+rabbitmq:
+  configuration: |
+    vm_memory_high_watermark = 0.7
+    disk_free_limit.relative = 1.0
+    quorum_wal_sync_strategy = batch
+```
+
+### **Filas Quorum como padrão**
+
+```yaml
+extraConfiguration: |
+  queue_master_locator = min-masters
+  default_queue_type = quorum
+```
+
+---
+
+# **6. Exemplo completo de StatefulSet otimizado**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  serviceName: rabbitmq
+  podManagementPolicy: Parallel
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: bitnami/rabbitmq:latest
+          resources:
+            limits:
+              cpu: 2
+              memory: 4Gi
+            requests:
+              cpu: 1
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami
+          readinessProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 15672
+          livenessProbe:
+            httpGet:
+              path: /api/health/checks/node
+              port: 15672
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        storageClassName: fast-nvme
+        resources:
+          requests:
+            storage: 200Gi
+```
+
+---
+
+# **7. Conclusão**
+
+Este documento fornece um conjunto de melhores práticas que abrangem:
+
+* Arquitetura de cluster RabbitMQ para alto volume
+* Configurações críticas do servidor
+* Observabilidade e manutenção
+* StatefulSet e Helm Chart corretamente otimizados
+
+Se quiser, posso gerar:
+
+* **PDF**
+* **DOCX**
+* **Markdown**
+* **PPTX**
+* **Um Helm Chart completo**
+* **Um values.yaml otimizado para HA e alta performance**
+
+É só pedir o formato desejado.
